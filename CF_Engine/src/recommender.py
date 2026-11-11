@@ -31,6 +31,135 @@ class Recommender(CFBase):
         return vod_map
 
     @staticmethod
+    def load_popular_items(conn, limit: int = 200) -> list[str]:
+        """serving.popular_recommendation 에서 인기 VOD를 score 내림차순으로 로드.
+
+        Cold/추천 부족 유저의 Fallback 후보. Normal_Recommendation 브랜치가 적재한
+        'POPULAR' 추천을 CF가 '읽기' 로 재사용한다(중복 vod는 최고 score 1건).
+        """
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT vod_id_fk, MAX(score) AS s
+            FROM serving.popular_recommendation
+            GROUP BY vod_id_fk
+            ORDER BY s DESC
+            LIMIT %s
+        """, (limit,))
+        items = [r[0] for r in cur.fetchall()]
+        cur.close()
+        log.info("Fallback 인기 아이템 로드: %d개", len(items))
+        return items
+
+    @staticmethod
+    def apply_fallback(records: list[dict], popular_items: list[str],
+                       top_k: int = 20, recommendation_type: str = "COLLABORATIVE",
+                       vod_series_map: dict | None = None,
+                       watched_by_user: dict | None = None,
+                       all_user_ids: list | None = None,
+                       fallback_score: float = 0.0) -> tuple[list[dict], dict]:
+        """유저별 추천이 top_k 미만이면 인기 아이템으로 중복 없이 채운다.
+
+        제외 규칙:
+          - 이미 해당 유저에게 추천된 VOD
+          - 이미 추천에 포함된 시리즈(에피소드 단위 유지 ct_cl 제외)
+          - 해당 유저가 이미 시청한 VOD(watched_by_user 제공 시)
+
+        Args:
+            records: build_records 출력(flat). user_id_fk/vod_id_fk/rank/score/type.
+            popular_items: 인기 VOD id 리스트(상위부터).
+            all_user_ids: 전체 대상 유저. records 에 없는(추천 0건) cold 유저도
+                이 목록에 있으면 인기 추천으로 생성한다. None이면 records 의 유저만.
+            watched_by_user: {user_id: set(vod_id)} 기시청 제외용.
+
+        Returns:
+            (new_records, stats). stats: 유저/보충 건수/잔여 부족 유저 수.
+        """
+        # 유저별 그룹화(원래 순서 유지)
+        by_user: dict = {}
+        order: list = []
+        for r in records:
+            uid = r["user_id_fk"]
+            if uid not in by_user:
+                by_user[uid] = []
+                order.append(uid)
+            by_user[uid].append(r)
+
+        # 추천 0건 cold 유저 포함
+        if all_user_ids is not None:
+            for uid in all_user_ids:
+                if uid not in by_user:
+                    by_user[uid] = []
+                    order.append(uid)
+
+        def series_of(vod_id):
+            if vod_series_map is None:
+                return None
+            series_nm, ct_cl = vod_series_map.get(vod_id, (vod_id, ""))
+            if ct_cl in _EPISODE_LEVEL_CT_CL:
+                return None   # 에피소드 단위 유지 → 시리즈 중복 제거 대상 아님
+            return series_nm
+
+        stats = {
+            "users_total": len(order),
+            "users_underfilled_before": 0,
+            "users_filled": 0,
+            "items_added": 0,
+            "users_zero_before": 0,
+            "users_still_short_after": 0,
+        }
+
+        new_records: list[dict] = []
+        for uid in order:
+            user_recs = by_user[uid]
+            if len(user_recs) == 0:
+                stats["users_zero_before"] += 1
+            if len(user_recs) < top_k:
+                stats["users_underfilled_before"] += 1
+
+            seen_vods = {r["vod_id_fk"] for r in user_recs}
+            seen_series = {s for s in (series_of(r["vod_id_fk"]) for r in user_recs) if s}
+            watched = watched_by_user.get(uid, set()) if watched_by_user else set()
+            rank = max((r["rank"] for r in user_recs), default=0)
+
+            filled = list(user_recs)
+            added_here = 0
+            if len(filled) < top_k:
+                for vod_id in popular_items:
+                    if len(filled) >= top_k:
+                        break
+                    if vod_id in seen_vods or vod_id in watched:
+                        continue
+                    s = series_of(vod_id)
+                    if s is not None and s in seen_series:
+                        continue
+                    rank += 1
+                    filled.append({
+                        "user_id_fk": uid,
+                        "vod_id_fk": vod_id,
+                        "rank": rank,
+                        "score": float(fallback_score),
+                        "recommendation_type": recommendation_type,
+                    })
+                    seen_vods.add(vod_id)
+                    if s is not None:
+                        seen_series.add(s)
+                    added_here += 1
+
+            if added_here > 0:
+                stats["users_filled"] += 1
+                stats["items_added"] += added_here
+            if len(filled) < top_k:
+                stats["users_still_short_after"] += 1
+            new_records.extend(filled)
+
+        log.info(
+            "Fallback 적용: 부족 유저 %d명(0건 %d명) → 보충 %d명 / %d건, 잔여 부족 %d명",
+            stats["users_underfilled_before"], stats["users_zero_before"],
+            stats["users_filled"], stats["items_added"], stats["users_still_short_after"],
+        )
+        return new_records, stats
+
+    @staticmethod
     def build_records(user_ids, item_indices, scores,
                       user_decoder: dict, item_decoder: dict,
                       recommendation_type: str = "CF",
@@ -81,3 +210,5 @@ class Recommender(CFBase):
 recommender = Recommender()
 load_vod_series_map = Recommender.load_vod_series_map
 build_records = Recommender.build_records
+load_popular_items = Recommender.load_popular_items
+apply_fallback = Recommender.apply_fallback

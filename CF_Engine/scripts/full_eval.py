@@ -1,11 +1,17 @@
 """
 CF_Engine 종합 추천 적절성 평가
-- NDCG@K, MRR, HitRate@K, Precision@K, Coverage
-- 필터 전/후 비교
-- 유저 이력 수 세그먼트별 분석 (Cold / Warm / Hot)
 
-실행: python scripts/full_eval.py
-      python scripts/full_eval.py --k 10
+모드(--mode):
+  fair    (권장) 동일 사용자·동일 정답(홀드아웃) 코호트에서 품질 필터 OFF/ON 비교.
+          전체 상호작용에 temporal 분리 1회 → OFF=전체 학습, ON=품질 아이템만 학습.
+          정답이 필터로 사라진 유저는 제외하고 그 수를 리포트에 명시.
+  legacy  (구방식) 필터 OFF/ON 각각 별도 행렬·별도 평가셋. 집합이 달라 직접 비교 불가.
+          비교 기준의 함정을 드러내기 위한 대조용으로만 유지.
+
+지표: NDCG@K, MRR, HitRate@K, Precision@K, Coverage + Cold/Warm/Hot 세그먼트.
+
+실행: python scripts/full_eval.py --mode fair --k 10
+      python scripts/full_eval.py --mode legacy --k 10
 """
 
 import sys
@@ -17,13 +23,17 @@ from pathlib import Path
 
 import yaml
 import numpy as np
-from scipy.sparse import csr_matrix
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.stdout.reconfigure(encoding="utf-8")
 
-from src.data_loader import get_conn, load_matrix
+from src.data_loader import get_conn, load_matrix, load_interactions
 from src.als_model import train
+from src.evaluation import (
+    temporal_holdout_split,
+    align_fair_cohort,
+    evaluate_rankings,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,211 +43,165 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── 지표 계산 함수 ─────────────────────────────────────────────────
-
-def split_holdout(mat: csr_matrix):
-    train_data = mat.copy().tolil()
-    test_items = {}
-    for uid in range(mat.shape[0]):
-        row = mat.getrow(uid)
-        nz = row.nonzero()[1]
-        if len(nz) < 2:
-            continue
-        hold = int(nz[-1])
-        test_items[uid] = hold
-        train_data[uid, hold] = 0
-    return csr_matrix(train_data), test_items
-
-
-def ndcg_at_k(recommended, relevant, k):
-    dcg = sum(1.0 / np.log2(i + 2) for i, item in enumerate(recommended[:k]) if item == relevant)
-    return dcg / (1.0 / np.log2(2))
+def load_quality_item_ids(conn) -> set:
+    """poster_url 과 vod_embedding 을 모두 가진 VOD(full_asset_id) 집합."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT v.full_asset_id
+        FROM public.vod v
+        JOIN public.vod_embedding ve ON v.full_asset_id = ve.vod_id_fk
+        WHERE v.poster_url IS NOT NULL
+    """)
+    ids = {r[0] for r in cur.fetchall()}
+    cur.close()
+    log.info("품질 아이템(poster+embedding): %d개", len(ids))
+    return ids
 
 
-def run_eval(model, train_mat, test_items, k, mat_original):
-    """전체 지표 계산 + 세그먼트별 분석"""
-    user_list = list(test_items.keys())
-    item_indices_all, _ = model.recommend(
-        user_list, train_mat[user_list],
-        N=k, filter_already_liked_items=True,
-    )
+def _recommend_dict(model, train_mat, test_items, k):
+    users = list(test_items.keys())
+    if not users:
+        return {}
+    item_idx, _ = model.recommend(
+        users, train_mat[users], N=k, filter_already_liked_items=True)
+    return {u: item_idx[i].tolist() for i, u in enumerate(users)}
 
-    ndcg_scores, mrr_scores, hits, precisions = [], [], [], []
-    recommended_items = set()
 
-    # 세그먼트: 유저 이력 수 기준
-    seg_results = {"cold (2~4)": [], "warm (5~19)": [], "hot (20+)": []}
+def _eval_model(train_mat, test_items, full_mat, m_cfg, k):
+    model = train(train_mat, factors=m_cfg["factors"],
+                  iterations=m_cfg["iterations"],
+                  regularization=m_cfg["regularization"])
+    rec = _recommend_dict(model, train_mat, test_items, k)
+    hist = {u: int(full_mat.getrow(u).nnz) for u in test_items}
+    return evaluate_rankings(rec, test_items, k=k,
+                             n_items=train_mat.shape[1], history_by_user=hist)
 
-    for i, uid in enumerate(user_list):
-        relevant = test_items[uid]
-        recs = item_indices_all[i].tolist()
-        recommended_items.update(recs)
 
-        hit = int(relevant in recs)
-        ndcg = ndcg_at_k(recs, relevant, k)
-        rank = recs.index(relevant) + 1 if relevant in recs else None
-        mrr = 1.0 / rank if rank else 0.0
-        precision = hit / k
+# ── 모드별 실행 ──────────────────────────────────────────────────────
 
-        hits.append(hit)
-        ndcg_scores.append(ndcg)
-        mrr_scores.append(mrr)
-        precisions.append(precision)
+def run_fair(conn, m_cfg, k):
+    """동일 코호트 OFF vs ON 비교."""
+    interactions = load_interactions(conn, filter_quality=False)
+    quality_items = load_quality_item_ids(conn)
+    conn.close()
 
-        # 세그먼트 분류
-        history_cnt = mat_original.getrow(uid).nnz
-        if history_cnt < 5:
-            seg_results["cold (2~4)"].append((ndcg, mrr, hit))
-        elif history_cnt < 20:
-            seg_results["warm (5~19)"].append((ndcg, mrr, hit))
-        else:
-            seg_results["hot (20+)"].append((ndcg, mrr, hit))
+    aligned = align_fair_cohort(interactions, quality_items, alpha=m_cfg["alpha"])
+    test_items = aligned["test_items_fair"]
+    full_mat = aligned["full_mat"]
 
-    n_items = train_mat.shape[1]
-    coverage = len(recommended_items) / n_items if n_items > 0 else 0
+    log.info("[OFF] 전체 학습 모델 평가")
+    res_off = _eval_model(aligned["train_off"], test_items, full_mat, m_cfg, k)
+    log.info("[ON] 품질 아이템 학습 모델 평가")
+    res_on = _eval_model(aligned["train_on"], test_items, full_mat, m_cfg, k)
 
-    metrics = {
-        f"NDCG@{k}":      np.mean(ndcg_scores),
-        f"MRR":            np.mean(mrr_scores),
-        f"HitRate@{k}":   np.mean(hits),
-        f"Precision@{k}": np.mean(precisions),
-        "Coverage":        coverage,
-        "eval_users":      len(user_list),
-        "n_items":         n_items,
+    return {
+        "mode": "fair",
+        "labels": ("필터 OFF (전체 학습)", "필터 ON (품질 아이템 학습)"),
+        "results": {"off": res_off, "on": res_on},
+        "stats": aligned["stats"],
     }
-    return metrics, seg_results
 
 
-def seg_summary(seg_results):
-    rows = {}
-    for seg, data in seg_results.items():
-        if not data:
-            rows[seg] = (0, 0.0, 0.0, 0.0)
-            continue
-        arr = np.array(data)
-        rows[seg] = (len(data), arr[:, 0].mean(), arr[:, 1].mean(), arr[:, 2].mean())
-    return rows
+def run_legacy(conn, m_cfg, k):
+    """구방식: 필터 OFF/ON 각각 별도 행렬·별도 평가셋(집합 불일치).
+
+    행렬만 있어 시간순 분리가 불가하므로 재현 가능한 무작위 분리(seed=42)를 쓴다.
+    """
+    from src.evaluation import random_holdout_split
+
+    out = {}
+    for idx, (key, use_filter) in enumerate([("off", False), ("on", True)]):
+        c = conn if idx == 0 else get_conn()   # 두 번째 반복은 새 커넥션
+        mat, *_ = load_matrix(c, alpha=m_cfg["alpha"], filter_quality=use_filter)
+        c.close()
+        train_mat, test_items = random_holdout_split(mat, seed=42)
+        out[key] = _eval_model(train_mat, test_items, mat, m_cfg, k)
+    return {
+        "mode": "legacy",
+        "labels": ("필터 OFF (별도 집합)", "필터 ON (별도 집합)"),
+        "results": out,
+        "stats": {"note": "OFF/ON 평가 사용자·아이템 집합이 서로 다름 — 직접 비교 불가"},
+    }
 
 
-# ── 메인 ──────────────────────────────────────────────────────────
+# ── 리포트 ───────────────────────────────────────────────────────────
+
+def write_report(payload, m_cfg, k):
+    labels = payload["labels"]
+    off = payload["results"]["off"]["overall"]
+    on = payload["results"]["on"]["overall"]
+    seg_off = payload["results"]["off"]["segments"]
+    seg_on = payload["results"]["on"]["segments"]
+    stats = payload["stats"]
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = Path("docs") / f"full_eval_report_{ts}.md"
+    path.parent.mkdir(exist_ok=True)
+
+    L = []
+    L.append(f"# CF_Engine 종합 평가 리포트 ({payload['mode']})\n\n")
+    L.append(f"- 일시: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+    L.append(f"- 모델: ALS factors={m_cfg['factors']}, iterations={m_cfg['iterations']}, "
+             f"regularization={m_cfg['regularization']}\n")
+    L.append(f"- k={k}\n\n")
+
+    if payload["mode"] == "fair":
+        L.append("## 공정 비교 조건\n\n")
+        L.append("전체 상호작용에 시간순(temporal) 분리를 1회 적용해 **동일 사용자·동일 "
+                 "정답**을 고정한 뒤, 품질 필터만 바꿔 평가했다.\n\n")
+        L.append(f"- 전체 평가 가능 유저: {stats['eval_users_all']:,}명\n")
+        L.append(f"- **공정 평가 유저(정답이 품질 아이템): {stats['eval_users_fair']:,}명**\n")
+        L.append(f"- 정답이 품질 필터로 제외되어 빠진 유저: "
+                 f"{stats['excluded_holdout_filtered']:,}명\n")
+        L.append(f"- 전체 아이템 {stats['n_items_total']:,}개 중 품질 아이템 "
+                 f"{stats['n_items_quality']:,}개\n\n")
+    else:
+        L.append("## ⚠ 구방식 경고\n\n")
+        L.append(f"> {stats.get('note')}\n\n")
+
+    metric_keys = [f"NDCG@{k}", "MRR", f"HitRate@{k}", f"Precision@{k}", "Coverage"]
+    L.append("## 전체 성능 비교\n\n")
+    L.append(f"| 지표 | {labels[0]} | {labels[1]} | 차이 |\n|---|---|---|---|\n")
+    for key in metric_keys:
+        v0 = off.get(key, 0.0)
+        v1 = on.get(key, 0.0)
+        d = v1 - v0
+        L.append(f"| {key} | {v0:.4f} | {v1:.4f} | {d:+.4f} {'↑' if d > 0 else '↓'} |\n")
+    L.append(f"\n> 평가 유저: {off['eval_users']:,}명 (양쪽 동일)\n\n"
+             if payload["mode"] == "fair"
+             else f"\n> OFF {off['eval_users']:,}명 / ON {on['eval_users']:,}명 (서로 다름)\n\n")
+
+    L.append("## 세그먼트별 (유저 이력 수)\n\n")
+    for label, seg in [(labels[0], seg_off), (labels[1], seg_on)]:
+        L.append(f"### {label}\n\n")
+        L.append(f"| 세그먼트 | 유저 수 | NDCG | MRR | HitRate |\n|---|---|---|---|---|\n")
+        for name, s in seg.items():
+            L.append(f"| {name} | {s['users']:,} | {s['NDCG']:.4f} | {s['MRR']:.4f} | {s['HitRate']:.4f} |\n")
+        L.append("\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(L)
+    log.info("리포트 저장: %s", path.resolve())
+    print(f"\n▶ 리포트: {path.resolve()}")
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/als_config.yaml")
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--mode", choices=["fair", "legacy"], default="fair")
     args = parser.parse_args()
 
     with open(args.config, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     m_cfg = cfg["model"]
 
-    results = {}
-    seg_results_all = {}
-
-    for label, use_filter in [("기존 (필터 없음)", False), ("필터 적용 (poster+embedding)", True)]:
-        log.info("=" * 55)
-        log.info("[%s] 평가 시작", label)
-        t0 = time.time()
-
-        conn = get_conn()
-        mat, _, _, _, _ = load_matrix(conn, alpha=m_cfg["alpha"], filter_quality=use_filter)
-        conn.close()
-
-        train_mat, test_items = split_holdout(mat)
-        log.info("테스트 유저: %d명", len(test_items))
-
-        model = train(train_mat, factors=m_cfg["factors"],
-                      iterations=m_cfg["iterations"],
-                      regularization=m_cfg["regularization"])
-
-        metrics, seg = run_eval(model, train_mat, test_items, args.k, mat)
-        metrics["elapsed"] = time.time() - t0
-        results[label] = metrics
-        seg_results_all[label] = seg_summary(seg)
-
-        for key, val in metrics.items():
-            if isinstance(val, float):
-                log.info("  %-20s %.4f", key, val)
-            else:
-                log.info("  %-20s %s", key, val)
-
-    # ── 리포트 생성 ────────────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = Path("docs") / f"full_eval_report_{timestamp}.md"
-    report_path.parent.mkdir(exist_ok=True)
-
-    labels = list(results.keys())
-    k = args.k
-
-    lines = []
-    lines.append(f"# CF_Engine 종합 추천 적절성 평가 리포트\n\n")
-    lines.append(f"- 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    lines.append(f"- 모델: ALS (factors={m_cfg['factors']}, iterations={m_cfg['iterations']}, regularization={m_cfg['regularization']})\n")
-    lines.append(f"- k={k}\n\n")
-
-    # 지표 설명
-    lines.append("## 지표 설명\n\n")
-    lines.append("| 지표 | 의미 | 기준 |\n|------|------|------|\n")
-    lines.append(f"| NDCG@{k} | 추천 순위의 질 — 정답이 상위에 있을수록 높음 | 0.3 이상이면 좋음 |\n")
-    lines.append(f"| MRR | 정답이 처음 등장하는 순위의 역수 평균 | 0.2 이상이면 좋음 |\n")
-    lines.append(f"| HitRate@{k} | Top-{k} 안에 정답이 1개라도 있는 유저 비율 | 0.6 이상이면 좋음 |\n")
-    lines.append(f"| Precision@{k} | 추천 {k}개 중 정답 비율 | HitRate/{k} |\n")
-    lines.append(f"| Coverage | 전체 아이템 중 추천에 등장하는 비율 (다양성) | 높을수록 다양 |\n\n")
-
-    # 전체 비교표
-    lines.append("## 필터 전/후 전체 성능 비교\n\n")
-    lines.append(f"| 지표 | {labels[0]} | {labels[1]} | 변화 |\n")
-    lines.append("|------|------------|------------|------|\n")
-
-    metric_keys = [f"NDCG@{k}", "MRR", f"HitRate@{k}", f"Precision@{k}", "Coverage"]
-    for key in metric_keys:
-        v0 = results[labels[0]][key]
-        v1 = results[labels[1]][key]
-        diff = v1 - v0
-        arrow = "↑" if diff > 0 else "↓"
-        lines.append(f"| {key} | {v0:.4f} | {v1:.4f} | {diff:+.4f} {arrow} |\n")
-
-    for label in labels:
-        lines.append(f"\n> **{label}**: 평가 유저 {results[label]['eval_users']:,}명 / 아이템 {results[label]['n_items']:,}개 / 소요 {results[label]['elapsed']:.1f}초\n")
-
-    # 세그먼트별 분석
-    lines.append("\n## 유저 이력 수 세그먼트별 성능\n\n")
-    for label in labels:
-        lines.append(f"### {label}\n\n")
-        lines.append(f"| 세그먼트 | 유저 수 | NDCG@{k} | MRR | HitRate@{k} |\n")
-        lines.append("|----------|---------|----------|-----|------------|\n")
-        for seg, (cnt, ndcg, mrr, hit) in seg_results_all[label].items():
-            lines.append(f"| {seg} | {cnt:,}명 | {ndcg:.4f} | {mrr:.4f} | {hit:.4f} |\n")
-        lines.append("\n")
-
-    # 종합 해석
-    lines.append("## 종합 해석\n\n")
-    base = results[labels[0]]
-    filt = results[labels[1]]
-
-    def safe_pct(a, b):
-        return (a - b) / b * 100 if b > 0 else 0.0
-
-    ndcg_imp = safe_pct(filt[f'NDCG@{k}'], base[f'NDCG@{k}'])
-    hit_imp  = safe_pct(filt[f'HitRate@{k}'], base[f'HitRate@{k}'])
-    mrr_imp  = safe_pct(filt['MRR'], base['MRR'])
-
-    lines.append(f"- poster_url 또는 vod_embedding 없는 VOD 제거 시 NDCG {ndcg_imp:+.1f}%, HitRate {hit_imp:+.1f}%, MRR {mrr_imp:+.1f}% 향상\n")
-
-    # Cold/Warm/Hot 해석
-    for label in labels:
-        segs = seg_results_all[label]
-        cold_hit = segs.get("cold (2~4)", (0,0,0,0))[3]
-        hot_hit  = segs.get("hot (20+)",  (0,0,0,0))[3]
-        lines.append(f"- [{label}] Cold(이력 2~4개) HitRate: {cold_hit:.4f} / Hot(20개+) HitRate: {hot_hit:.4f}\n")
-
-    lines.append(f"\n> 기준: NDCG@{k} 0.3 이상 = 매우 좋음 / HitRate@{k} 0.6 이상 = 매우 좋음\n")
-
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    log.info("리포트 저장: %s", report_path.resolve())
-    print(f"\n▶ 리포트: {report_path.resolve()}")
+    t0 = time.time()
+    conn = get_conn()
+    payload = run_fair(conn, m_cfg, args.k) if args.mode == "fair" \
+        else run_legacy(conn, m_cfg, args.k)
+    write_report(payload, m_cfg, args.k)
+    log.info("소요: %.1f초", time.time() - t0)
 
 
 if __name__ == "__main__":

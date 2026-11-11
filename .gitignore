@@ -271,3 +271,6 @@ Database_Design/docs/vod_mart_data.csv
 
 # 발표용 아키텍처 다이어그램 (로컬 전용)
 API_Server/docs/architecture_diagram.*
+
+# CF_Engine 실행 로그 (자동 생성)
+CF_Engine/logs/

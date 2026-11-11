@@ -69,15 +69,52 @@ class DataLoader(CFBase):
             dtype=np.float32,
         )
 
-        sparsity = 1 - mat.nnz / (mat.shape[0] * mat.shape[1])
+        cells = mat.shape[0] * mat.shape[1]
+        sparsity = (1 - mat.nnz / cells) if cells else 0.0
         log.info(
-            "행렬: %d x %d  |  희소성: %.2f%%",
-            mat.shape[0], mat.shape[1], sparsity * 100,
+            "행렬: %d x %d  |  상호작용: %d건  |  희소성: %.2f%%",
+            mat.shape[0], mat.shape[1], mat.nnz, sparsity * 100,
         )
         return mat, user_encoder, item_encoder, user_decoder, item_decoder
+
+    def load_interactions(self, conn, filter_quality: bool = False):
+        """watch_history 상호작용을 시청 시각(strt_dt) 포함 raw 행으로 로드.
+
+        시간순 Hold-out 분리(src.evaluation.temporal_holdout_split)용. 집계 전
+        개별 상호작용을 반환하므로 반복 시청·시각 정보를 평가 단계에서 활용한다.
+
+        Returns:
+            List[tuple]: (user_id_fk, vod_id_fk, completion_rate, strt_dt)
+        """
+        log.info("watch_history 로드(시각 포함)%s...", " (품질 필터 ON)" if filter_quality else "")
+        cur = conn.cursor()
+        if filter_quality:
+            cur.execute("""
+                SELECT w.user_id_fk, w.vod_id_fk, w.completion_rate, w.strt_dt
+                FROM public.watch_history w
+                JOIN public.vod v ON w.vod_id_fk = v.full_asset_id
+                JOIN public.vod_embedding ve ON w.vod_id_fk = ve.vod_id_fk
+                JOIN public."user" u ON u.sha2_hash = w.user_id_fk
+                WHERE w.completion_rate IS NOT NULL
+                  AND v.poster_url IS NOT NULL
+                  AND u.is_test = FALSE
+            """)
+        else:
+            cur.execute("""
+                SELECT w.user_id_fk, w.vod_id_fk, w.completion_rate, w.strt_dt
+                FROM public.watch_history w
+                JOIN public."user" u ON u.sha2_hash = w.user_id_fk
+                WHERE w.completion_rate IS NOT NULL
+                  AND u.is_test = FALSE
+            """)
+        rows = cur.fetchall()
+        cur.close()
+        log.info("상호작용 로드 완료: %d건", len(rows))
+        return rows
 
 
 # ── 모듈 레벨 싱글턴 + 하위 호환 별칭 ──────────────────────────────────────
 data_loader = DataLoader()
 get_conn = CFBase.get_conn
 load_matrix = data_loader.load_matrix
+load_interactions = data_loader.load_interactions
