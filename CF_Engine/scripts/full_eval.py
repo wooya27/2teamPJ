@@ -29,11 +29,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 from src.data_loader import get_conn, load_matrix, load_interactions
 from src.als_model import train
-from src.evaluation import (
-    temporal_holdout_split,
-    align_fair_cohort,
-    evaluate_rankings,
-)
+from src.evaluation import align_fair_cohort, evaluate_rankings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,23 +54,28 @@ def load_quality_item_ids(conn) -> set:
     return ids
 
 
-def _recommend_dict(model, train_mat, test_items, k):
+def _recommend_dict(model, train_mat, test_items, k, candidate_items=None):
     users = list(test_items.keys())
     if not users:
         return {}
+    kwargs = {}
+    if candidate_items is not None:
+        # implicit: 추천 후보를 이 아이템 인덱스 부분집합으로 제한
+        kwargs["items"] = candidate_items
     item_idx, _ = model.recommend(
-        users, train_mat[users], N=k, filter_already_liked_items=True)
+        users, train_mat[users], N=k, filter_already_liked_items=True, **kwargs)
     return {u: item_idx[i].tolist() for i, u in enumerate(users)}
 
 
-def _eval_model(train_mat, test_items, full_mat, m_cfg, k):
+def _eval_model(train_mat, test_items, full_mat, m_cfg, k, candidate_items=None):
     model = train(train_mat, factors=m_cfg["factors"],
                   iterations=m_cfg["iterations"],
                   regularization=m_cfg["regularization"])
-    rec = _recommend_dict(model, train_mat, test_items, k)
+    rec = _recommend_dict(model, train_mat, test_items, k, candidate_items)
     hist = {u: int(full_mat.getrow(u).nnz) for u in test_items}
+    n_items = len(candidate_items) if candidate_items is not None else train_mat.shape[1]
     return evaluate_rankings(rec, test_items, k=k,
-                             n_items=train_mat.shape[1], history_by_user=hist)
+                             n_items=n_items, history_by_user=hist)
 
 
 # ── 모드별 실행 ──────────────────────────────────────────────────────
@@ -89,10 +90,13 @@ def run_fair(conn, m_cfg, k):
     test_items = aligned["test_items_fair"]
     full_mat = aligned["full_mat"]
 
-    log.info("[OFF] 전체 학습 모델 평가")
+    quality_cols = np.array(aligned["quality_cols"], dtype=np.int64)
+
+    log.info("[OFF] 전체 학습 모델 평가 (후보 전체)")
     res_off = _eval_model(aligned["train_off"], test_items, full_mat, m_cfg, k)
-    log.info("[ON] 품질 아이템 학습 모델 평가")
-    res_on = _eval_model(aligned["train_on"], test_items, full_mat, m_cfg, k)
+    log.info("[ON] 품질 아이템 학습 모델 평가 (후보를 품질 아이템으로 제한)")
+    res_on = _eval_model(aligned["train_on"], test_items, full_mat, m_cfg, k,
+                         candidate_items=quality_cols)
 
     return {
         "mode": "fair",

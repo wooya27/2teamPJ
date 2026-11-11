@@ -42,6 +42,11 @@ ON/OFF 는 **평가 사용자 수도(147,104 vs 166,766), 아이템 집합도, �
 핵심: **인코더 공간(shape)을 공유**하므로 OFF/ON 모델의 아이템 인덱스가 호환되고,
 `test_items_fair`·`history_by_user` 가 두 모델에 **동일하게** 적용된다 → apples-to-apples.
 
+**추천 후보 제한(중요)**: 학습행렬 컬럼을 0으로 만들어도 ALS는 비품질 아이템을
+낮은 점수로 추천 후보에 포함할 수 있다. 따라서 ON 평가 시 `model.recommend(..., items=quality_cols)`
+로 **추천 후보 자체를 품질 아이템으로 제한**해, "품질 콘텐츠만 추천" 조건을 엄밀히 보장한다
+(`align_fair_cohort` 가 `quality_cols` 반환). Coverage 분모도 품질 아이템 수로 맞춘다.
+
 ### 3.2 리포트 산출물 (계획서 체크 4·5·6)
 
 `full_eval.py --mode fair` 가 리포트에 다음을 함께 기재:
@@ -69,6 +74,7 @@ $ python -m pytest CF_Engine/tests/test_fair_compare.py -q
 - `restrict_matrix_columns`: 비품질 컬럼 질량 0, shape 유지 ✔
 - 홀드아웃 정답이 비품질인 유저 **제외**, 품질인 유저 **포함** ✔
 - ON 학습행렬엔 비품질 아이템 질량 0 / OFF엔 존재, 동일 shape ✔
+- `quality_cols` 반환(ON 추천 후보 제한용) ✔
 - stats 의 전체·품질 아이템 수 집계 ✔
 
 ## 5. 완료 기준 대비

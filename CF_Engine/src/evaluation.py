@@ -218,6 +218,7 @@ def align_fair_cohort(interactions, quality_items, alpha: float = 40.0,
         "test_items_fair": test_items_fair,
         "encoders": encoders,
         "full_mat": full_mat,
+        "quality_cols": sorted(quality_cols),   # ON 모델 추천 후보 제한용
         "stats": stats,
     }
 

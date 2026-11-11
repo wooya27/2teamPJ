@@ -81,6 +81,19 @@ def test_align_on_model_has_no_mass_on_nonquality():
     assert train_on.shape == train_off.shape
 
 
+def test_align_returns_quality_cols_for_candidate_restriction():
+    """ON 모델 추천 후보 제한에 쓸 품질 컬럼 인덱스를 반환한다."""
+    interactions = [
+        ("u", "a", 0.5, _ts(0)),
+        ("u", "b", 0.5, _ts(1)),
+        ("u", "c", 0.9, _ts(2)),
+    ]
+    quality = {"a", "c"}
+    res = align_fair_cohort(interactions, quality, alpha=40)
+    i_enc = res["encoders"][1]
+    assert res["quality_cols"] == sorted([i_enc["a"], i_enc["c"]])
+
+
 def test_align_stats_item_counts():
     interactions = [
         ("u", "a", 0.5, _ts(0)),
