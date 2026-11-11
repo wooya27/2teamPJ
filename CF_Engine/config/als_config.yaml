@@ -4,11 +4,20 @@ model:
   regularization: 0.01
   alpha: 40
 
+data:
+  # True → poster_url AND vod_embedding 둘 다 있는 VOD만 학습·평가에 사용.
+  # 학습(train.py)과 평가(evaluate.py/full_eval.py)가 동일한 필터 정의를 공유한다.
+  # CLI --filter-quality / --no-filter-quality 로 실행 단위 override 가능.
+  filter_quality: false
+
 recommend:
   top_k: 20
   # DB CHECK 제약 허용값: 'VISUAL_SIMILARITY' | 'COLLABORATIVE' | 'HYBRID'
   # (Database_Design/schemas/create_embedding_tables.sql chk_rec_type 참조)
   recommendation_type: "COLLABORATIVE"
+  # Cold/추천 부족 유저를 serving.popular_recommendation 인기 아이템으로 채움
+  fallback: true
+  fallback_limit: 200   # 인기 후보 로드 개수
 
 db:
   batch_size: 1000
